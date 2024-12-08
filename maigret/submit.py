@@ -1,18 +1,21 @@
 import asyncio
 import json
 import re
-from typing import List
-from xml.etree import ElementTree
-from aiohttp import TCPConnector, ClientSession
-import requests
+import os
+from typing import Any, Dict, List, Optional
+
+from aiohttp import ClientSession, TCPConnector
+from aiohttp_socks import ProxyConnector
 import cloudscraper
+from colorama import Fore, Style
 
 from .activation import import_aiohttp_cookies
-from .checking import maigret
-from .result import QueryStatus
+from .result import MaigretCheckResult
 from .settings import Settings
-from .sites import MaigretDatabase, MaigretSite, MaigretEngine
-from .utils import get_random_user_agent, get_match_ratio
+from .sites import MaigretDatabase, MaigretEngine, MaigretSite
+from .utils import get_random_user_agent
+from .checking import site_self_check
+from .utils import get_match_ratio
 
 
 class CloudflareSession:
@@ -42,7 +45,7 @@ class Submitter:
         "User-Agent": get_random_user_agent(),
     }
 
-    SEPARATORS = "\"'"
+    SEPARATORS = "\"'\n"
 
     RATIO = 0.6
     TOP_FEATURES = 5
@@ -59,7 +62,10 @@ class Submitter:
         proxy = self.args.proxy
         cookie_jar = None
         if args.cookie_file:
-            cookie_jar = import_aiohttp_cookies(args.cookie_file)
+            if not os.path.exists(args.cookie_file):
+                logger.error(f"Cookie file {args.cookie_file} does not exist!")
+            else:
+                cookie_jar = import_aiohttp_cookies(args.cookie_file)
 
         connector = ProxyConnector.from_url(proxy) if proxy else TCPConnector(ssl=False)
         connector.verify_ssl = False
@@ -67,8 +73,14 @@ class Submitter:
             connector=connector, trust_env=True, cookie_jar=cookie_jar
         )
 
+    async def close(self):
+        await self.session.close()
+
     @staticmethod
     def get_alexa_rank(site_url_main):
+        import requests
+        import xml.etree.ElementTree as ElementTree
+
         url = f"http://data.alexa.com/data?cli=10&url={site_url_main}"
         xml_data = requests.get(url).text
         root = ElementTree.fromstring(xml_data)
@@ -86,71 +98,18 @@ class Submitter:
         return "/".join(url.split("/", 3)[:3])
 
     async def site_self_check(self, site, semaphore, silent=False):
-        changes = {
-            "disabled": False,
-        }
-
-        check_data = [
-            (site.username_claimed, QueryStatus.CLAIMED),
-            (site.username_unclaimed, QueryStatus.AVAILABLE),
-        ]
-
-        self.logger.info(f"Checking {site.name}...")
-
-        for username, status in check_data:
-            results_dict = await maigret(
-                username=username,
-                site_dict={site.name: site},
-                proxy=self.args.proxy,
-                logger=self.logger,
-                cookies=self.args.cookie_file,
-                timeout=30,
-                id_type=site.type,
-                forced=True,
-                no_progressbar=True,
-            )
-
-            # don't disable entries with other ids types
-            # TODO: make normal checking
-            if site.name not in results_dict:
-                self.logger.info(results_dict)
-                changes["disabled"] = True
-                continue
-
-            result = results_dict[site.name]["status"]
-
-            site_status = result.status
-
-            if site_status != status:
-                if site_status == QueryStatus.UNKNOWN:
-                    msgs = site.absence_strs
-                    etype = site.check_type
-                    self.logger.warning(
-                        "Error while searching '%s' in %s: %s, %s, check type %s",
-                        username,
-                        site.name,
-                        result.context,
-                        msgs,
-                        etype,
-                    )
-                    # don't disable in case of available username
-                    if status == QueryStatus.CLAIMED:
-                        changes["disabled"] = True
-                elif status == QueryStatus.CLAIMED:
-                    self.logger.warning(
-                        f"Not found `{username}` in {site.name}, must be claimed"
-                    )
-                    self.logger.info(results_dict[site.name])
-                    changes["disabled"] = True
-                else:
-                    self.logger.warning(
-                        f"Found `{username}` in {site.name}, must be available"
-                    )
-                    self.logger.info(results_dict[site.name])
-                    changes["disabled"] = True
-
-        self.logger.info(f"Site {site.name} checking is finished")
-
+        # Call the general function from the checking.py
+        changes = await site_self_check(
+            site=site,
+            logger=self.logger,
+            semaphore=semaphore,
+            db=self.db,
+            silent=silent,
+            proxy=self.args.proxy,
+            cookies=self.args.cookie_file,
+            # Don't skip errors in submit mode - we need check both false positives/true negatives
+            skip_errors=False,
+        )
         return changes
 
     def generate_additional_fields_dialog(self, engine: MaigretEngine, dialog):
@@ -168,7 +127,9 @@ class Submitter:
     async def detect_known_engine(
         self, url_exists, url_mainpage
     ) -> [List[MaigretSite], str]:
+
         resp_text = ''
+
         try:
             r = await self.session.get(url_mainpage)
             content = await r.content.read()
@@ -176,8 +137,8 @@ class Submitter:
             resp_text = content.decode(charset, "ignore")
             self.logger.debug(resp_text)
         except Exception as e:
-            self.logger.warning(e)
-            print("Some error while checking main page")
+            self.logger.warning(e, exc_info=True)
+            print(f"Some error while checking main page: {e}")
             return [], resp_text
 
         for engine in self.db.engines:
@@ -205,7 +166,7 @@ class Submitter:
                     for u in usernames_to_check:
                         site_data = {
                             "urlMain": url_mainpage,
-                            "name": url_mainpage.split("//")[1],
+                            "name": url_mainpage.split("//")[1].split("/")[0],
                             "engine": engine_name,
                             "usernameClaimed": u,
                             "usernameUnclaimed": "noonewouldeverusethis7",
@@ -285,6 +246,10 @@ class Submitter:
         a_minus_b = tokens_a.difference(tokens_b)
         b_minus_a = tokens_b.difference(tokens_a)
 
+        # additional filtering by html response
+        a_minus_b = [t for t in a_minus_b if t not in non_exists_resp_text]
+        b_minus_a = [t for t in b_minus_a if t not in exists_resp_text]
+
         if len(a_minus_b) == len(b_minus_a) == 0:
             print("The pages for existing and non-existing account are the same!")
 
@@ -301,6 +266,8 @@ class Submitter:
             :top_features_count
         ]
 
+        self.logger.debug([(keyword, match_fun(keyword)) for keyword in presence_list])
+
         print("Detected text features of existing account: " + ", ".join(presence_list))
         features = input("If features was not detected correctly, write it manually: ")
 
@@ -310,6 +277,8 @@ class Submitter:
         absence_list = sorted(b_minus_a, key=match_fun, reverse=True)[
             :top_features_count
         ]
+        self.logger.debug([(keyword, match_fun(keyword)) for keyword in absence_list])
+
         print(
             "Detected text features of non-existing account: " + ", ".join(absence_list)
         )
@@ -333,6 +302,78 @@ class Submitter:
 
         site = MaigretSite(url_mainpage.split("/")[-1], site_data)
         return site
+
+    async def add_site(self, site):
+        sem = asyncio.Semaphore(1)
+        print(
+            f"{Fore.BLUE}{Style.BRIGHT}[*] Adding site {site.name}, let's check it...{Style.RESET_ALL}"
+        )
+
+        result = await self.site_self_check(site, sem)
+        if result["disabled"]:
+            print(f"Checks failed for {site.name}, please, verify them manually.")
+            return {
+                "valid": False,
+                "reason": "checks_failed",
+            }
+
+        while True:
+            print("\nAvailable fields to edit:")
+            editable_fields = {
+                '1': 'name',
+                '2': 'tags',
+                '3': 'url',
+                '4': 'url_main',
+                '5': 'username_claimed',
+                '6': 'username_unclaimed',
+                '7': 'presense_strs',
+                '8': 'absence_strs',
+            }
+
+            for num, field in editable_fields.items():
+                current_value = getattr(site, field)
+                print(f"{num}. {field} (current: {current_value})")
+
+            print("0. finish editing")
+            print("10. reject and block domain")
+            print("11. invalid params, remove")
+
+            choice = input("\nSelect field number to edit (0-8): ").strip()
+
+            if choice == '0':
+                break
+
+            if choice == '10':
+                return {
+                    "valid": False,
+                    "reason": "manual block",
+                }
+
+            if choice == '11':
+                return {
+                    "valid": False,
+                    "reason": "remove",
+                }
+
+            if choice in editable_fields:
+                field = editable_fields[choice]
+                current_value = getattr(site, field)
+                new_value = input(
+                    f"Enter new value for {field} (current: {current_value}): "
+                ).strip()
+
+                if field in ['tags', 'presense_strs', 'absence_strs']:
+                    new_value = list(map(str.strip, new_value.split(',')))
+
+                if new_value:
+                    setattr(site, field, new_value)
+                    print(f"Updated {field} to: {new_value}")
+
+        self.logger.info(site.json)
+        self.db.update_site(site)
+        return {
+            "valid": True,
+        }
 
     async def dialog(self, url_exists, cookie_file):
         domain_raw = self.URL_RE.sub("", url_exists).strip().strip("/")
@@ -412,7 +453,7 @@ class Submitter:
 
         if not found:
             print(
-                f"Sorry, we couldn't find params to detect account presence/absence in {chosen_site.name}."
+                f"{Fore.RED}[!] The check for site '{chosen_site.name}' failed!{Style.RESET_ALL}"
             )
             print(
                 "Try to run this mode again and increase features count or choose others."
@@ -445,4 +486,11 @@ class Submitter:
         site_data = chosen_site.strip_engine_data()
         self.logger.debug(site_data.json)
         self.db.update_site(site_data)
+
+        if self.args.db_file != self.settings.sites_db_path:
+            print(
+                f"{Fore.GREEN}[+] Maigret DB is saved to {self.args.db}.{Style.RESET_ALL}"
+            )
+            self.db.save_to_file(self.args.db)
+
         return True
