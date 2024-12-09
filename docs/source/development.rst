@@ -4,7 +4,7 @@ Development
 ==============
 
 Frequently Asked Questions
-------------------------- 
+--------------------------
 
 1. Where to find the list of supported sites?
 
@@ -33,7 +33,7 @@ Install test requirements:
 
 .. code-block:: console
 
-  pip install -r test-requirements.txt
+  poetry install --with dev
 
 
 Use the following commands to check Maigret:
@@ -47,6 +47,9 @@ Use the following commands to check Maigret:
   # - mypy checks
   make lint
 
+  # run black formatter
+  make format
+
   # run testing with coverage html report
   # current test coverage is 58%
   make test
@@ -54,9 +57,16 @@ Use the following commands to check Maigret:
   # open html report
   open htmlcov/index.html
 
+  # get flamechart of imports to estimate startup time
+  make speed
+
 
 How to fix false-positives
 -----------------------------------------------
+
+If you want to work with sites database, don't forget to activate statistics update git hook, command for it would look like this: ``git config --local core.hooksPath .githooks/``.
+
+You should make your git commits from your maigret git repo folder, or else the hook wouldn't find the statistics update script.
 
 1. Determine the problematic site.
 
@@ -102,6 +112,65 @@ There are few options for sites data.json helpful in various cases:
 - ``headers`` - a dictionary of additional headers to be sent to the site
 - ``requestHeadOnly`` - set to ``true`` if it's enough to make a HEAD request to the site
 - ``regexCheck`` - a regex to check if the username is valid, in case of frequent false-positives
+
+.. _activation-mechanism:
+
+Activation mechanism
+--------------------
+
+The activation mechanism helps make requests to sites requiring additional authentication like cookies, JWT tokens, or custom headers.
+
+Let's study the Vimeo site check record from the Maigret database:
+
+.. code-block:: json
+
+      "Vimeo": {
+          "tags": [
+              "us",
+              "video"
+          ],
+          "headers": {
+              "Authorization": "jwt eyJ0..."
+          },
+          "activation": {
+              "url": "https://vimeo.com/_rv/viewer",
+              "marks": [
+                  "Something strange occurred. Please get in touch with the app's creator."
+              ],
+              "method": "vimeo"
+          },
+          "urlProbe": "https://api.vimeo.com/users/{username}?fields=name...",
+          "checkType": "status_code",
+          "alexaRank": 148,
+          "urlMain": "https://vimeo.com/",
+          "url": "https://vimeo.com/{username}",
+          "usernameClaimed": "blue",
+          "usernameUnclaimed": "noonewouldeverusethis7"
+      },
+
+The activation method is:
+
+.. code-block:: python
+
+    def vimeo(site, logger, cookies={}):
+        headers = dict(site.headers)
+        if "Authorization" in headers:
+            del headers["Authorization"]
+        import requests
+
+        r = requests.get(site.activation["url"], headers=headers)
+        jwt_token = r.json()["jwt"]
+        site.headers["Authorization"] = "jwt " + jwt_token
+
+Here's how the activation process works when a JWT token becomes invalid:
+
+1. The site check makes an HTTP request to ``urlProbe`` with the invalid token
+2. The response contains an error message specified in the ``activation``/``marks`` field
+3. When this error is detected, the ``vimeo`` activation function is triggered
+4. The activation function obtains a new JWT token and updates it in the site check record
+5. On the next site check (either through retry or a new Maigret run), the valid token is used and the check succeeds
+
+Examples of activation mechanism implementation are available in `activation.py <https://github.com/soxoj/maigret/blob/main/maigret/activation.py>`_ file.
 
 How to publish new version of Maigret
 -------------------------------------
@@ -170,7 +239,7 @@ PyPi package.
 8. That's all, now you can simply wait push to PyPi. You can monitor it in Action page: https://github.com/soxoj/maigret/actions/workflows/python-publish.yml
 
 Documentation updates
---------------------
+---------------------
 
 Documentations is auto-generated and auto-deployed from the ``docs`` directory.
 
@@ -181,3 +250,13 @@ To manually update documentation:
 3. Run ``make singlehtml`` in the terminal in the docs directory.
 4. Open ``build/singlehtml/index.html`` in your browser to see the result.
 5. If everything is ok, commit and push your changes to GitHub. 
+
+Roadmap
+-------
+
+.. warning::
+   This roadmap requires updating to reflect the current project status and future plans.
+
+.. figure:: https://i.imgur.com/kk8cFdR.png   
+   :target: https://i.imgur.com/kk8cFdR.png
+   :align: center
