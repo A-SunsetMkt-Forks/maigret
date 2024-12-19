@@ -1,7 +1,7 @@
 LINT_FILES=maigret wizard.py tests
 
 test:
-	coverage run --source=./maigret -m pytest tests
+	coverage run --source=./maigret,./maigret/web -m pytest tests
 	coverage report -m
 	coverage html
 
@@ -16,10 +16,10 @@ lint:
 	flake8 --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics --ignore=E731,W503,E501 ${LINT_FILES}
 
 	@echo 'mypy'
-	mypy ${LINT_FILES}
+	mypy --check-untyped-defs ${LINT_FILES}
 
 speed:
-	time python3 ./maigret.py --version
+	time python3 -m maigret --version
 	python3 -c "import timeit; t = timeit.Timer('import maigret'); print(t.timeit(number = 1000000))"
 	python3 -X importtime -c "import maigret" 2> maigret-import.log
 	python3 -m tuna maigret-import.log
